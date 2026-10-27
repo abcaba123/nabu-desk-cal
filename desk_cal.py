@@ -13,7 +13,7 @@
   python desk_cal.py --autostart on|off  로그인 때 자동 실행 등록/해제 (HKCU Run 'NabuDeskCal')
 
 exe 배포판(10-27 조나스용, desk_cal_release.py가 GitHub 공개 저장소 릴리스로 낸다): 처음 실행하면
-%LOCALAPPDATA%\\nabu-desk-cal\\desk_cal.exe로 복사·자동 실행 등록하고, 6시간마다 새 릴리스를 받아 스스로 바꿔 띄운다.
+%LOCALAPPDATA%\\nabu-desk-cal\\desk_cal.exe로 복사·자동 실행 등록하고, 켤 때·24시간마다 새 릴리스를 받아 스스로 바꿔 띄운다.
 노션 토큰·후보 표는 ⚙ 설정의 '노션 연결'에 넣는다(config.json — 이 PC의 ~/.config/notion/.env보다 먼저).
 
 데이터: %APPDATA%\\nabu-desk-cal\\ — cells.json(메모·색) holidays.json notion_cache.json config.json desk_cal.log
@@ -49,7 +49,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import colorchooser, ttk
 
-VERSION = "1.0.1"  # exe 배포판 — 올리고 desk_cal_release.py를 돌리면 설치된 exe들이 받아 간다
+VERSION = "1.0.2"  # exe 배포판 — 올리고 desk_cal_release.py를 돌리면 설치된 exe들이 받아 간다
 REPO = "abcaba123/nabu-desk-cal"
 FROZEN = getattr(sys, "frozen", False)
 INSTALL = Path(os.environ["LOCALAPPDATA"]) / "nabu-desk-cal" / "desk_cal.exe"
@@ -59,7 +59,7 @@ ENV = Path.home() / ".config" / "notion" / ".env"
 HOLIDAYS = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "desk_cal_holidays.json"
 NV = "2022-06-28"
 SYNC_MS = 5 * 60 * 1000
-UPDATE_MS = 6 * 3600 * 1000
+UPDATE_MS = 24 * 3600 * 1000  # DesktopCal 업데이터와 같은 하루 주기(10-27 사용자)
 MUTEX = None
 
 STATUS_ORDER = ["촬영 확정", "예정", "다음 순위", "후보", "조사 대기", "대기", "보류"]
