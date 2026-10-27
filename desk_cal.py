@@ -49,7 +49,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import colorchooser, ttk
 
-VERSION = "1.0.0"  # exe 배포판 — 올리고 desk_cal_release.py를 돌리면 설치된 exe들이 받아 간다
+VERSION = "1.0.1"  # exe 배포판 — 올리고 desk_cal_release.py를 돌리면 설치된 exe들이 받아 간다
 REPO = "abcaba123/nabu-desk-cal"
 FROZEN = getattr(sys, "frozen", False)
 INSTALL = Path(os.environ["LOCALAPPDATA"]) / "nabu-desk-cal" / "desk_cal.exe"
@@ -113,6 +113,9 @@ u.EnumChildWindows.argtypes = [W.HWND, ENUMPROC, W.LPARAM]
 u.SetLayeredWindowAttributes.argtypes = [W.HWND, W.DWORD, ctypes.c_ubyte, W.DWORD]
 u.MonitorFromPoint.restype = W.HMONITOR
 u.MonitorFromPoint.argtypes = [W.POINT, W.DWORD]
+k32.CreateMutexW.restype = W.HANDLE
+k32.CreateMutexW.argtypes = [ctypes.c_void_p, W.BOOL, W.LPCWSTR]
+k32.CloseHandle.argtypes = [W.HANDLE]
 
 
 def log(msg):
@@ -422,15 +425,20 @@ def fetch_update():
             return None
         asset = next(a for a in rel["assets"] if a["name"] == "desk_cal.exe")
         want = re.search(r"sha256:\s*([0-9a-f]{64})", rel.get("body") or "").group(1)
-        new, h = INSTALL.with_name("desk_cal.new.exe"), hashlib.sha256()
-        with get(asset["browser_download_url"]) as r, open(new, "wb") as f:
+        if want == hashlib.sha256(INSTALL.read_bytes()).hexdigest():  # 태그만 새것 — 받고 다시 띄우기를 되풀이하지 않게
+            log(f"업데이트 {rel['tag_name']} = 지금 exe와 같은 파일 — 건너뜀")
+            return None
+        part, h = INSTALL.with_name("desk_cal.part"), hashlib.sha256()  # 확인을 통과한 것만 .new.exe가 된다
+        with get(asset["browser_download_url"]) as r, open(part, "wb") as f:
             while chunk := r.read(1 << 16):
                 h.update(chunk)
                 f.write(chunk)
-        if h.hexdigest() != want or new.stat().st_size != asset["size"]:
-            new.unlink()
+        if h.hexdigest() != want or part.stat().st_size != asset["size"]:
+            part.unlink()
             log(f"업데이트 {rel['tag_name']} 파일 확인 실패 — 버림")
             return None
+        new = INSTALL.with_name("desk_cal.new.exe")
+        os.replace(part, new)
         log(f"업데이트 {rel['tag_name']} 받음")
         return new
     except Exception as e:
@@ -447,13 +455,23 @@ def relaunch():
 def install():
     """다운로드 폴더 등에서 처음 실행 → 설치 자리로 복사·자동 실행 등록 후 설치본을 띄운다(업데이트가 늘 같은 파일을 바꾸게)"""
     INSTALL.parent.mkdir(parents=True, exist_ok=True)
+    tmp = INSTALL.with_name("desk_cal.install.tmp")  # 다 복사한 뒤 바꾼다 — 중간에 실패해도 설치본이 반쪽이 되지 않게
     try:
-        shutil.copyfile(sys.executable, INSTALL)
-    except OSError:  # 설치본이 켜져 있어 못 덮음
+        shutil.copyfile(sys.executable, tmp)
+    except OSError as e:
+        u.MessageBoxW(None, f"설치 실패: {e}", "바탕화면 달력", 0x10)
+        return
+    try:
+        os.replace(tmp, INSTALL)
+    except OSError:  # 설치본이 켜져 있어 못 바꿈
+        tmp.unlink(missing_ok=True)
         u.MessageBoxW(None, "달력이 이미 켜져 있어요.", "바탕화면 달력", 0x40)
         return
-    set_autostart(True)
-    relaunch()
+    try:
+        set_autostart(True)
+        relaunch()
+    except OSError as e:
+        u.MessageBoxW(None, f"설치 실패: {e}", "바탕화면 달력", 0x10)
 
 
 # ───────────── 달력 ─────────────
@@ -513,6 +531,8 @@ class DeskCal:
 
     def check_update(self):
         self.root.after(UPDATE_MS, self.check_update)
+        if self.update_file:  # 받아 둔 게 창이 닫히길 기다리는 중 — 같은 자리에 다시 받지 않는다(Codex desk-cal-dist 1)
+            return
         threading.Thread(target=lambda: self.q.put(("update", fetch_update())), daemon=True).start()
 
     def try_update(self):
@@ -525,9 +545,10 @@ class DeskCal:
             os.replace(INSTALL, old)
             os.replace(self.update_file, INSTALL)
         except OSError as e:
-            log(f"업데이트 못 바꿈: {e}")
-            if not INSTALL.exists() and old.exists():
+            if not INSTALL.exists() and old.exists():  # 되돌리기를 로그보다 먼저
                 os.replace(old, INSTALL)
+            self.update_file = None  # 다음 정기 확인 때 다시 받는다
+            log(f"업데이트 못 바꿈: {e}")
             return
         log("업데이트 — 새 exe로 다시 띄움")
         self.relaunch = True
@@ -1330,8 +1351,10 @@ def main():
         except OSError:
             pass
     global MUTEX  # 데이터 폴더마다 하나 — 시험용 APPDATA로 띄운 것과 안 겹치게. 업데이트로 다시 띄울 때 놓는다
-    MUTEX = k32.CreateMutexW(None, False, f"Local\\nabu-desk-cal-{zlib.crc32(str(DATA).lower().encode()):08x}")
+    name = f"Local\\nabu-desk-cal-{zlib.crc32(str(DATA).lower().encode()):08x}"
+    MUTEX = k32.CreateMutexW(None, False, name)
     if ctypes.get_last_error() == 183:
+        k32.CloseHandle(MUTEX)  # 안내창이 떠 있는 동안 쥐고 있으면 업데이트로 다시 뜨는 달력이 '이미 실행 중'으로 꺼진다(Codex 3)
         if FROZEN:
             u.MessageBoxW(None, "달력이 이미 켜져 있어요.", "바탕화면 달력", 0x40)
         print("이미 실행 중")
@@ -1371,8 +1394,12 @@ def main():
             continue
         if app.relaunch:
             k32.CloseHandle(MUTEX)
-            relaunch()
-            break
+            try:
+                relaunch()
+                break
+            except OSError:  # 새 exe(이미 제자리)를 못 띄움 — 이 프로세스로 계속, 다음 로그인 때 새 exe가 뜬다
+                log("새 exe를 못 띄움 — 지금 것으로 계속\n" + traceback.format_exc())
+                MUTEX = k32.CreateMutexW(None, False, name)
         if app.quit:
             break
         time.sleep(3)  # 탐색기가 다시 뜰 시간
