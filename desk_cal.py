@@ -49,7 +49,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import colorchooser, ttk
 
-VERSION = "1.0.2"  # exe 배포판 — 올리고 desk_cal_release.py를 돌리면 설치된 exe들이 받아 간다
+VERSION = "1.0.3"  # exe 배포판 — 올리고 desk_cal_release.py를 돌리면 설치된 exe들이 받아 간다
 REPO = "abcaba123/nabu-desk-cal"
 FROZEN = getattr(sys, "frozen", False)
 INSTALL = Path(os.environ["LOCALAPPDATA"]) / "nabu-desk-cal" / "desk_cal.exe"
@@ -70,8 +70,13 @@ GAME_ORDER = ["마크", "GTA", "공통"]
 STATUS_BG = {"촬영 확정": "#2e7d32", "예정": "#00838f", "다음 순위": "#1565c0", "후보": "#546e7a",
              "조사 대기": "#6d4c41", "대기": "#616161", "보류": "#424242"}
 GAME_BG = {"마크": "#3737f4", "GTA": "#c2185b", "공통": "#00897b"}  # 마크 = 사용자가 DesktopCal '마크 컨텐츠'에 쓴 파랑
-# DesktopCal 테마에서 뽑은 색 (10-26 화면 캡처)
-FRAME, HEAD, CELL, WEEKEND, TODAY, HOLI = "#4a5459", "#3a3b3c", "#3a3b3c", "#d34b09", "#ffd54f", "#ffd54f"
+# DesktopCal 테마에서 뽑은 색 (10-26 화면 캡처). HEAD는 후보·달 고르기 창 바탕
+HEAD, TODAY, HOLI = "#3a3b3c", "#ffd54f", "#ffd54f"
+# 달력 칸 = DesktopCal처럼 칸 사이·바깥은 뚫고 칸 바탕만 반투명(10-28 사용자 「회색 그걸로 바탕이 투명해야지」).
+# 10-26 캡처색 #3a3b3c·주말 #d34b09는 단색 바탕화면 #4a5459 위에 섞인 값 — 칸 #383838·투명도 10%(DesktopCal board_item_trans)면 같은 색
+CELL, WEEKEND, CELL_TRANS = "#383838", "#e24a00", 10
+KEY, BKEY = "#393838", "#010203"  # 앞(글씨) 창·뒤(칸 바탕) 창에서 뚫리는 색 — KEY는 칸 회색 가까이(글씨 가장자리가 칸에 섞이게)
+TITLE_H, GRIP, GRIP_H = 40, 18, 14  # 맨 윗줄(끌면 옮김) · 오른쪽 아래 크기 손잡이
 POP_BG, ROW_BG, ROW_HOVER = "#2f3133", "#3a3c3e", "#4a4d50"
 FONT = "맑은 고딕"
 DOW = "일월화수목금토"
@@ -154,6 +159,12 @@ def backup_cells():
 def bmp(s):
     """Tk 8.6은 BMP 밖 글자(이모지 다수)를 못 그린다 — 빼고 그린다"""
     return "".join(c for c in (s or "") if ord(c) <= 0xFFFF)
+
+
+def cref(hexc):
+    """#rrggbb → COLORREF(0x00bbggrr)"""
+    r, g, b = (int(hexc[i:i + 2], 16) for i in (1, 3, 5))
+    return b << 16 | g << 8 | r
 
 
 def colorref(h):
@@ -390,6 +401,15 @@ def attach(hwnd, lv, rect):
     return True
 
 
+def put(hwnd, lv, rect):
+    """붙은 채로 옮기기·크기 바꾸기(쌓인 순서는 그대로) — 안 붙었으면 화면 좌표"""
+    pt = W.POINT(0, 0)
+    if lv:
+        u.ClientToScreen(lv, ctypes.byref(pt))
+    x, y, w, h = rect
+    u.SetWindowPos(hwnd, None, x - pt.x, y - pt.y, w, h, 0x0004 | 0x0010)  # NOZORDER|NOACTIVATE
+
+
 def work_area(x, y):
     class MI(ctypes.Structure):
         _fields_ = [("cbSize", W.DWORD), ("rcMonitor", W.RECT), ("rcWork", W.RECT), ("dwFlags", W.DWORD)]
@@ -495,6 +515,7 @@ class DeskCal:
         self.saving, self.rows_started = False, 0.0
         self.today_seen = dt.date.today()
         self.stages = {"확정", "후보"}  # 후보 창 단계 버튼 — 달력이 켜져 있는 동안 기억
+        self.drag, self.redraw = None, None
         self.root = tk.Tk()
         try:
             self._build(rect, attach_desktop)
@@ -506,18 +527,28 @@ class DeskCal:
         self.root.overrideredirect(True)
         self.root.report_callback_exception = lambda *a: log("".join(traceback.format_exception(*a)))
         x, y, w, h = rect
-        self.root.geometry(f"{w}x{h}+{x}+{y}")
-        self.cv = tk.Canvas(self.root, bg=FRAME, highlightthickness=0, width=w, height=h)
-        self.cv.pack(fill="both", expand=True)
-        self.cv.bind("<Button-1>", self.on_click)
-        self.cv.bind("<Double-Button-1>", self.on_double)
-        self.cv.bind("<Button-3>", self.on_menu)
-        self.cv.bind("<MouseWheel>", lambda e: self.shift(-1 if e.delta > 0 else 1))
+        # 두 겹 — 뒤 = 칸 바탕(BKEY는 뚫리고 나머지는 ⚙ 칸 투명도만큼 비침), 앞 = 글씨(KEY만 뚫려 글씨는 진하게)
+        self.back = tk.Toplevel(self.root)
+        self.back.overrideredirect(True)
+        self.bcv = tk.Canvas(self.back, bg=BKEY, highlightthickness=0, width=w, height=h)
+        self.cv = tk.Canvas(self.root, bg=KEY, highlightthickness=0, width=w, height=h)
+        for top, c in ((self.back, self.bcv), (self.root, self.cv)):  # 뚫린 곳을 누르면 아래 창으로 가서 둘 다 받는다
+            top.geometry(f"{w}x{h}+{x}+{y}")
+            c.pack(fill="both", expand=True)
+            c.bind("<Button-1>", self.on_press)
+            c.bind("<B1-Motion>", self.on_drag)
+            c.bind("<ButtonRelease-1>", self.on_release)
+            c.bind("<Motion>", self.on_hover)
+            c.bind("<Double-Button-1>", self.on_double)
+            c.bind("<Button-3>", self.on_menu)
+            c.bind("<MouseWheel>", lambda e: self.shift(-1 if e.delta > 0 else 1))
         self.root.update()
-        self.hwnd = int(self.root.wm_frame(), 16)
+        self.hwnd, self.bhwnd = int(self.root.wm_frame(), 16), int(self.back.wm_frame(), 16)
         self.lv = desktop_listview() if attach_desktop else None
-        if self.lv and not attach(self.hwnd, self.lv, rect):
+        if self.lv and not self.attach(self.lv):
             self.lv = None  # 못 붙었으면 watch()가 5초마다 다시 시도
+        if not self.lv:
+            self.root.lift()
         if attach_desktop and not self.lv:
             log("바탕화면에 못 붙음 — 일반 창으로 뜨고 5초마다 다시 시도")
         self.apply_alpha()
@@ -646,7 +677,7 @@ class DeskCal:
     def watch(self):
         """탐색기가 다시 뜨면 아이콘 창이 바뀐다. 우리 창이 같이 죽었으면 바깥 루프가 다시 만들고,
         살아 있는데 붙을 곳이 없으면(탐색기가 늦게 뜸) 새 아이콘 창을 찾아 다시 붙는다"""
-        if not u.IsWindow(self.hwnd):
+        if not (u.IsWindow(self.hwnd) and u.IsWindow(self.bhwnd)):
             log("바탕화면 창과 같이 닫힘 — 다시 만든다")
             self.stop(restart=True)
             return
@@ -654,7 +685,7 @@ class DeskCal:
         try:
             if self.want_attach and (not self.lv or not u.IsWindow(self.lv)):
                 lv = desktop_listview()
-                if lv and attach(self.hwnd, lv, self.rect):
+                if lv and self.attach(lv):
                     self.lv = lv
                     self.apply_alpha()
                     log("바탕화면에 다시 붙음")
@@ -689,11 +720,12 @@ class DeskCal:
 
     # 그리기
     def draw(self):
-        cv, (_, _, w, h) = self.cv, self.rect
+        cv, bc, (_, _, w, h) = self.cv, self.bcv, self.rect  # 바탕은 bc(뒤), 글씨·오늘 테두리는 cv(앞)
         cv.delete("all")
+        bc.delete("all")
         self.hits, self.cellmap = [], []
-        HH, M, G, DH = 40, 6, 2, 22
-        cv.create_rectangle(0, 0, w, HH, fill=HEAD, width=0)
+        HH, M, G, DH = TITLE_H, 6, 2, 22
+        bc.create_rectangle(0, 0, w, HH, fill=CELL, width=0)
         t = cv.create_text(w // 2, HH // 2, text=f"{self.month.year}년{self.month.month}월 ▾", fill="#fff3c4",
                            font=(FONT, 12, "bold"))
         x1, _, x2, _ = cv.bbox(t)
@@ -711,14 +743,14 @@ class DeskCal:
         top = HH + 4
         for i, d in enumerate(DOW):
             x = M + i * (cw + G)
-            cv.create_rectangle(x, top, x + cw, top + DH, fill=HEAD, width=0)
+            bc.create_rectangle(x, top, x + cw, top + DH, fill=CELL, width=0)
             cv.create_text(x + cw / 2, top + DH / 2, text=d + "요일", fill="#fff3c4", font=(FONT, 9))
         first = self.month
         off = (first.weekday() + 1) % 7  # 일요일 시작(DesktopCal과 같게)
         ndays = ((first.replace(day=28) + dt.timedelta(days=4)).replace(day=1) - first).days
         weeks = (off + ndays + 6) // 7
         gtop = top + DH + G
-        ch = (h - gtop - M - (weeks - 1) * G) / weeks
+        ch = (h - gtop - GRIP_H - (weeks - 1) * G) / weeks  # 아래 여백 = 크기 손잡이 자리
         today, picks, fonts = dt.date.today(), self.picks(), self.fonts()
         fam, size, bold, dcol = fonts["date"]
         dfont = (fam, size, "bold" if bold else "normal")
@@ -734,8 +766,9 @@ class DeskCal:
             mine, cell = picks.get(iso, []), self.cells.get(iso, {})
             bg = (GAME_BG.get(mine[0]["game"], GAME_BG["마크"]) if mine else cell.get("bg")
                   or (WEEKEND if day.weekday() >= 5 else CELL))
-            cv.create_rectangle(x, y, x + cw, y + ch, fill=bg, width=2 if day == today else 0,
-                                outline=fonts["today"] if day == today else "")
+            bc.create_rectangle(x, y, x + cw, y + ch, fill=bg, width=0)
+            if day == today:
+                cv.create_rectangle(x, y, x + cw, y + ch, width=2, outline=fonts["today"])
             num = cv.create_text(x + 4, y + 3, text=str(day.day), fill=dcol, anchor="nw", font=dfont)
             ty = cv.bbox(num)[3] + 2
             lx = cv.bbox(num)[2] + 8
@@ -753,6 +786,9 @@ class DeskCal:
                     break
                 ty = y2 + 1
             self.cellmap.append((x, y, x + cw, y + ch, day))
+        bc.create_rectangle(w - GRIP, h - GRIP_H, w, h, fill=CELL, width=0)  # 뚫린 곳은 눌러도 바탕화면으로 가서 바탕을 깐다
+        for k in (4, 8, 12):
+            cv.create_line(w - k, h - 2, w - 2, h - k, fill="#b0bec5")
 
     def shift(self, n):
         m = self.month.month - 1 + n
@@ -763,11 +799,52 @@ class DeskCal:
         self.month = dt.date.today().replace(day=1)
         self.draw()
 
-    def on_click(self, e):
+    def hit(self, e):
         for x1, y1, x2, y2, fn in self.hits:
             if x1 <= e.x <= x2 and y1 <= e.y <= y2:
-                fn()
-                return
+                return fn
+        return None
+
+    def in_grip(self, e):
+        return e.x >= self.rect[2] - GRIP and e.y >= self.rect[3] - GRIP_H
+
+    def on_hover(self, e):
+        cur = "size_nw_se" if self.in_grip(e) else "fleur" if e.y < TITLE_H and not self.hit(e) else ""
+        if e.widget["cursor"] != cur:
+            e.widget.config(cursor=cur)
+
+    def on_press(self, e):
+        """버튼이면 누르고, 오른쪽 아래 손잡이는 크기, 맨 윗줄 빈 곳은 위치 끌기(10-28 사용자 「크기 조절이 없고」)"""
+        self.drag = None
+        if not self.lv:
+            self.root.lift()  # 일반 창으로 떠 있을 때 뒤 창을 눌러도 글씨 창이 밑으로 안 가게
+        fn = self.hit(e)
+        if fn:
+            fn()
+        elif self.in_grip(e) or e.y < TITLE_H:
+            self.drag = ("size" if self.in_grip(e) else "move", e.x_root, e.y_root, self.rect)
+
+    def on_drag(self, e):
+        if not self.drag:
+            return
+        kind, x0, y0, (x, y, w, h) = self.drag
+        dx, dy = e.x_root - x0, e.y_root - y0
+        self.rect = (x + dx, y + dy, w, h) if kind == "move" else (x, y, max(400, w + dx), max(300, h + dy))
+        for hwnd in (self.bhwnd, self.hwnd):
+            put(hwnd, self.lv, self.rect)
+        if kind == "size" and not self.redraw:
+            self.redraw = self.root.after(40, self.redraw_now)
+
+    def redraw_now(self):
+        self.redraw = None
+        self.draw()
+
+    def on_release(self, e):
+        if self.drag and list(self.rect) != self.cfg["rect"]:
+            self.cfg["rect"] = list(self.rect)
+            jsave("config.json", self.cfg)
+            self.draw()
+        self.drag = None
 
     def on_double(self, e):
         for x1, y1, x2, y2, day in self.cellmap:
@@ -808,15 +885,16 @@ class DeskCal:
             out.append((solar_terms(day.year)[iso], TERM_COLOR))
         return out
 
+    def attach(self, lv):
+        """뒤(칸 바탕)를 먼저 붙이고 앞(글씨)을 그 위에"""
+        return attach(self.bhwnd, lv, self.rect) and attach(self.hwnd, lv, self.rect)
+
     def apply_alpha(self):
-        """칸 투명도(⚙, 0~60%) — 창 전체에 걸려 글씨도 같이 옅어진다. 0이면 투명 끔"""
-        pct = int(self.cfg.get("alpha", 0))
-        ex = u.GetWindowLongPtrW(self.hwnd, -20)
-        if pct > 0:
-            u.SetWindowLongPtrW(self.hwnd, -20, ex | 0x80000)  # WS_EX_LAYERED
-            u.SetLayeredWindowAttributes(self.hwnd, 0, round(255 * (100 - pct) / 100), 2)  # LWA_ALPHA
-        elif ex & 0x80000:
-            u.SetWindowLongPtrW(self.hwnd, -20, ex & ~0x80000)
+        """앞 창은 KEY만 뚫어 글씨만 남기고, 뒤 창은 BKEY(칸 사이·바깥)를 뚫고 칸 바탕은 ⚙ 칸 투명도만큼 비치게"""
+        pct = int(self.cfg.get("cell_trans", CELL_TRANS))
+        for hwnd, key, alpha, flags in ((self.hwnd, KEY, 255, 1), (self.bhwnd, BKEY, round(255 * (100 - pct) / 100), 3)):
+            u.SetWindowLongPtrW(hwnd, -20, u.GetWindowLongPtrW(hwnd, -20) | 0x80000)  # WS_EX_LAYERED
+            u.SetLayeredWindowAttributes(hwnd, cref(key), alpha, flags)  # 1 = LWA_COLORKEY, 2 = LWA_ALPHA
 
     def open_settings(self):
         if getattr(self, "settings", None) and self.settings.top.winfo_exists():
@@ -1216,11 +1294,11 @@ class Settings:
         self.today_btn = tk.Button(t, text="  색  ", bg=self.today, relief="flat", command=lambda: self.pick("today"))
         self.today_btn.grid(row=2, column=4)
         tk.Label(t, text="칸 투명도 %", fg="#ffffff", bg=POP_BG, font=(FONT, 10)).grid(row=3, column=0, sticky="w")
-        self.alpha = tk.IntVar(value=int(app.cfg.get("alpha", 0)))
-        tk.Scale(t, from_=0, to=60, orient="horizontal", variable=self.alpha, command=lambda v: self.apply(),
+        self.alpha = tk.IntVar(value=int(app.cfg.get("cell_trans", CELL_TRANS)))
+        tk.Scale(t, from_=0, to=90, orient="horizontal", variable=self.alpha, command=lambda v: self.apply(),
                  length=220, bg=POP_BG, fg="#ffffff", highlightthickness=0, troughcolor=ROW_BG).grid(
             row=3, column=1, sticky="w", padx=6)
-        tk.Label(t, text="글씨도 같이 옅어짐 · 바탕화면이 단색이면 0이 DesktopCal과 같은 색", fg="#b0bec5", bg=POP_BG,
+        tk.Label(t, text="칸 바탕만 비침(글씨는 그대로) · 칸 사이·바깥은 바탕화면 · DesktopCal 기본 10", fg="#b0bec5", bg=POP_BG,
                  font=(FONT, 8)).grid(row=4, column=1, columnspan=4, sticky="w", padx=6)
         self.terms, self.days = (tk.BooleanVar(value=app.cfg.get(k, True)) for k in ("show_terms", "show_days"))
         opts = tk.Frame(t, bg=POP_BG)
@@ -1276,7 +1354,7 @@ class Settings:
             fonts[key] = [fv.get(), size, bool(bv.get()), color]
         self.app.cfg["fonts"] = fonts
         if hasattr(self, "days"):  # 창을 다 그리기 전(색 고르기 등)엔 글꼴만
-            self.app.cfg.update(alpha=int(self.alpha.get()), show_terms=bool(self.terms.get()),
+            self.app.cfg.update(cell_trans=int(self.alpha.get()), show_terms=bool(self.terms.get()),
                                 show_days=bool(self.days.get()))
             self.app.apply_alpha()
         jsave("config.json", self.app.cfg)
