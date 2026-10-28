@@ -49,7 +49,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import colorchooser, ttk
 
-VERSION = "1.0.4"  # exe 배포판 — 올리고 desk_cal_release.py를 돌리면 설치된 exe들이 받아 간다
+VERSION = "1.0.5"  # exe 배포판 — 올리고 desk_cal_release.py를 돌리면 설치된 exe들이 받아 간다
 REPO = "abcaba123/nabu-desk-cal"
 FROZEN = getattr(sys, "frozen", False)
 INSTALL = Path(os.environ["LOCALAPPDATA"]) / "nabu-desk-cal" / "desk_cal.exe"
@@ -76,7 +76,10 @@ HEAD, TODAY, HOLI = "#3a3b3c", "#ffd54f", "#ffd54f"
 # 10-26 캡처색 #3a3b3c·주말 #d34b09는 단색 바탕화면 #4a5459 위에 섞인 값 — 칸 #383838·투명도 10%(DesktopCal board_item_trans)면 같은 색
 CELL, WEEKEND, CELL_TRANS = "#383838", "#e24a00", 10
 KEY, BKEY = "#393838", "#010203"  # 앞(글씨) 창·뒤(칸 바탕) 창에서 뚫리는 색 — KEY는 칸 회색 가까이(글씨 가장자리가 칸에 섞이게)
-TITLE_H, GRIP, GRIP_H = 40, 18, 14  # 맨 윗줄(끌면 옮김) · 오른쪽 아래 크기 손잡이
+# 위치·크기 바꾸기(우클릭·⚙에서 켬): 테두리 EDGE px 안을 끌면 그 변의 크기, 안쪽을 끌면 위치
+EDGE, MIN_W, MIN_H, EDIT_COLOR = 12, 400, 300, "#4fc3f7"
+EDGE_CURSOR = {"": "fleur", "n": "size_ns", "s": "size_ns", "w": "size_we", "e": "size_we",
+               "nw": "size_nw_se", "se": "size_nw_se", "ne": "size_ne_sw", "sw": "size_ne_sw"}
 POP_BG, ROW_BG, ROW_HOVER = "#2f3133", "#3a3c3e", "#4a4d50"
 FONT = "맑은 고딕"
 DOW = "일월화수목금토"
@@ -520,7 +523,7 @@ class DeskCal:
         self.saving, self.rows_started = False, 0.0
         self.today_seen = dt.date.today()
         self.stages = {"확정", "후보"}  # 후보 창 단계 버튼 — 달력이 켜져 있는 동안 기억
-        self.drag, self.redraw, self.last_click = None, None, None
+        self.drag, self.redraw, self.last_click, self.edit = None, None, None, None
         self.root = tk.Tk()
         try:
             self._build(rect, attach_desktop)
@@ -545,7 +548,7 @@ class DeskCal:
             c.bind("<ButtonRelease-1>", self.on_release)
             c.bind("<Motion>", self.on_hover)
             c.bind("<Button-3>", self.on_menu)
-            c.bind("<MouseWheel>", lambda e: self.shift(-1 if e.delta > 0 else 1))
+            c.bind("<MouseWheel>", lambda e: self.edit or self.shift(-1 if e.delta > 0 else 1))
         self.root.update()
         self.hwnd, self.bhwnd = int(self.root.wm_frame(), 16), int(self.back.wm_frame(), 16)
         self.lv = desktop_listview() if attach_desktop else None
@@ -570,8 +573,8 @@ class DeskCal:
         threading.Thread(target=lambda: self.q.put(("update", fetch_update())), daemon=True).start()
 
     def try_update(self):
-        """받아 둔 새 exe로 바꿔 띄운다 — 후보 창·설정 창을 쓰는 중이면 1분 뒤 다시. 실행 중인 exe는 지울 순 없어도 이름은 바꿀 수 있다"""
-        if self.popup or (getattr(self, "settings", None) and self.settings.top.winfo_exists()):
+        """받아 둔 새 exe로 바꿔 띄운다 — 후보 창·설정 창·위치 바꾸기를 쓰는 중이면 1분 뒤 다시. 실행 중인 exe는 지울 순 없어도 이름은 바꿀 수 있다"""
+        if self.popup or self.edit or (getattr(self, "settings", None) and self.settings.top.winfo_exists()):
             self.root.after(60_000, self.try_update)
             return
         old = INSTALL.with_name("desk_cal.old.exe")
@@ -727,7 +730,9 @@ class DeskCal:
         cv.delete("all")
         bc.delete("all")
         self.hits, self.cellmap = [], []
-        HH, M, G, DH = TITLE_H, 6, 2, 22
+        if self.edit:
+            return self.draw_edit(w, h)
+        HH, M, G, DH = 40, 6, 2, 22
         bc.create_rectangle(0, 0, w, HH, fill=CELL, width=0)
         t = cv.create_text(w // 2, HH // 2, text=f"{self.month.year}년{self.month.month}월 ▾", fill="#fff3c4",
                            font=(FONT, 12, "bold"))
@@ -738,7 +743,8 @@ class DeskCal:
         bx = w - M
         for label, fn in [("⚙", self.open_settings), ("⟳", self.sync), ("›", lambda: self.shift(1)), ("오늘", self.today),
                           ("‹", lambda: self.shift(-1))]:
-            t = cv.create_text(bx, HH // 2, text=label, fill="#ffffff", anchor="e", font=(FONT, 13 if len(label) == 1 else 10, "bold"))
+            fam = "Segoe UI Symbol" if label in "⚙⟳" else FONT  # 맑은 고딕엔 ⚙⟳가 없어 그릴 때마다 대체 글꼴을 찾느라 4.8ms → 0.1ms(10-28 실측)
+            t = cv.create_text(bx, HH // 2, text=label, fill="#ffffff", anchor="e", font=(fam, 13 if len(label) == 1 else 10, "bold"))
             x1, y1, x2, y2 = cv.bbox(t)
             self.hits.append((x1 - 6, 0, x2 + 6, HH, fn))
             bx = x1 - 16
@@ -753,7 +759,7 @@ class DeskCal:
         ndays = ((first.replace(day=28) + dt.timedelta(days=4)).replace(day=1) - first).days
         weeks = (off + ndays + 6) // 7
         gtop = top + DH + G
-        ch = (h - gtop - GRIP_H - (weeks - 1) * G) / weeks  # 아래 여백 = 크기 손잡이 자리
+        ch = (h - gtop - M - (weeks - 1) * G) / weeks
         today, picks, fonts = dt.date.today(), self.picks(), self.fonts()
         fam, size, bold, dcol = fonts["date"]
         dfont, dcol = (fam, size, "bold" if bold else "normal"), ink(dcol, KEY)
@@ -790,9 +796,34 @@ class DeskCal:
                     break
                 ty = y2 + 1
             self.cellmap.append((x, y, x + cw, y + ch, day))
-        bc.create_rectangle(w - GRIP, h - GRIP_H, w, h, fill=CELL, width=0)  # 뚫린 곳은 눌러도 바탕화면으로 가서 바탕을 깐다
-        for k in (4, 8, 12):
-            cv.create_line(w - k, h - 2, w - 2, h - k, fill="#b0bec5")
+
+    def draw_edit(self, w, h):
+        """위치·크기 바꾸기 화면 — 칸 대신 가벼운 판(테두리·칸 선·손잡이·저장/취소)만 그려 끌 때마다 다시 그려도 안 끊긴다.
+        뒤 창을 통째로 칠해 뚫린 곳이 없으니 어디를 눌러도 달력이 받는다"""
+        cv, bc = self.cv, self.bcv
+        bc.create_rectangle(0, 0, w, h, fill=CELL, width=0)
+        cw, top = (w - 12) / 7, 66
+        for i in range(1, 7):
+            cv.create_line(6 + i * cw, top, 6 + i * cw, h - 6, fill="#546e7a")
+        for i in range(1, 6):
+            y = top + i * (h - top - 6) / 6
+            cv.create_line(6, y, w - 6, y, fill="#546e7a")
+        cv.create_line(6, 40, w - 6, 40, fill="#546e7a")
+        cv.create_rectangle(1, 1, w - 1, h - 1, outline=EDIT_COLOR, width=2)
+        for hx in (6, w // 2, w - 6):
+            for hy in (6, h // 2, h - 6):
+                if (hx, hy) != (w // 2, h // 2):
+                    cv.create_rectangle(hx - 6, hy - 6, hx + 6, hy + 6, fill=EDIT_COLOR, outline="")
+        mx, my, bw = w // 2, h // 2, min(230, w // 2 - 24)
+        cv.create_rectangle(mx - bw, my - 78, mx + bw, my + 62, fill=POP_BG, outline=EDIT_COLOR)
+        cv.create_text(mx, my - 52, text=f"{w} × {h}", fill="#ffffff", font=(FONT, 16, "bold"))
+        cv.create_text(mx, my - 22, text="안쪽을 끌면 위치 · 테두리·모서리를 끌면 크기", fill="#b0bec5", font=(FONT, 10))
+        for dx, label, color, fn in ((-60, "저장", "#2e7d32", lambda: self.end_edit(True)),
+                                     (60, "취소", "#455a64", lambda: self.end_edit(False))):
+            box = (mx + dx - 50, my + 6, mx + dx + 50, my + 44)
+            cv.create_rectangle(*box, fill=color, outline="")
+            cv.create_text(mx + dx, my + 25, text=label, fill="#ffffff", font=(FONT, 11, "bold"))
+            self.hits.append((*box, fn))
 
     def shift(self, n):
         m = self.month.month - 1 + n
@@ -809,13 +840,37 @@ class DeskCal:
                 return fn
         return None
 
-    def in_grip(self, e):
-        return e.x >= self.rect[2] - GRIP and e.y >= self.rect[3] - GRIP_H
+    def edge(self, e):
+        """위치·크기 바꾸기에서 누른 자리 — 테두리 EDGE px 안이면 그 변(모서리는 두 변), 안쪽이면 '' = 옮기기"""
+        w, h = self.rect[2], self.rect[3]
+        return ("n" if e.y < EDGE else "s" if e.y > h - EDGE else "") + ("w" if e.x < EDGE else "e" if e.x > w - EDGE else "")
 
     def on_hover(self, e):
-        cur = "size_nw_se" if self.in_grip(e) else "fleur" if e.y < TITLE_H and not self.hit(e) else ""
+        cur = ("hand2" if self.hit(e) else EDGE_CURSOR[self.edge(e)]) if self.edit else ""
         if e.widget["cursor"] != cur:
             e.widget.config(cursor=cur)
+
+    def start_edit(self):
+        """위치·크기 바꾸기 켜기(10-28 사용자 「버튼을 눌러야 활성화 … 저장해야 저장되고 취소하면 원래 상태대로」) —
+        평소엔 끌어도 안 움직인다(다음 달 누르다 위치가 바뀌던 것)"""
+        if not self.edit:
+            self.edit = {"orig": self.rect}
+            self.draw()
+
+    def end_edit(self, save):
+        if not self.edit:
+            return
+        if save:
+            self.cfg["rect"] = list(self.rect)
+            jsave("config.json", self.cfg)
+        else:
+            self.rect = self.edit["orig"]
+            for hwnd in (self.bhwnd, self.hwnd):
+                put(hwnd, self.lv, self.rect)
+        self.edit = self.drag = None
+        for c in (self.cv, self.bcv):
+            c.config(cursor="")
+        self.draw()
 
     def keep_order(self):
         """뒤 창을 앞 창 바로 밑으로 — 일반 창으로 떠 있을 때 뒤 창이 눌려 활성화되면 글씨가 가려진다(Codex desk-cal-layers 1)"""
@@ -828,7 +883,7 @@ class DeskCal:
         return None
 
     def on_press(self, e):
-        """버튼이면 누르고, 오른쪽 아래 손잡이는 크기, 맨 윗줄 빈 곳은 위치 끌기(10-28 사용자 「크기 조절이 없고」).
+        """버튼이면 누르고, 위치·크기 바꾸기 중이면 끌기 시작.
         날짜 칸 두 번 누르기도 여기서 센다 — 첫 번째가 글씨(앞 창), 두 번째가 바탕(뒤 창)에 떨어지면 Tk는 더블클릭으로
         안 치고, Tk 더블클릭 바인딩은 윗줄 버튼을 빨리 두 번 누를 때 두 번째를 삼킨다(Codex desk-cal-layers 3)"""
         self.drag = None
@@ -836,8 +891,8 @@ class DeskCal:
         fn = self.hit(e)
         if fn:
             fn()
-        elif self.in_grip(e) or e.y < TITLE_H:
-            self.drag = ("size" if self.in_grip(e) else "move", e.x_root, e.y_root, self.rect)
+        elif self.edit:
+            self.drag = (self.edge(e), e.x_root, e.y_root, self.rect)
         else:
             day, last = self.day_at(e.x, e.y), self.last_click
             self.last_click = (day, e.time, e.x_root, e.y_root)
@@ -850,23 +905,33 @@ class DeskCal:
     def on_drag(self, e):
         if not self.drag:
             return
-        kind, x0, y0, (x, y, w, h) = self.drag
+        side, x0, y0, (x, y, w, h) = self.drag
         dx, dy = e.x_root - x0, e.y_root - y0
-        self.rect = (x + dx, y + dy, w, h) if kind == "move" else (x, y, max(400, w + dx), max(300, h + dy))
+        if not side:
+            x, y = x + dx, y + dy
+        if "w" in side:
+            dx = min(dx, w - MIN_W)
+            x, w = x + dx, w - dx
+        elif "e" in side:
+            w = max(MIN_W, w + dx)
+        if "n" in side:
+            dy = min(dy, h - MIN_H)
+            y, h = y + dy, h - dy
+        elif "s" in side:
+            h = max(MIN_H, h + dy)
+        if (x, y, w, h) == self.rect:
+            return
+        self.rect = (x, y, w, h)
         for hwnd in (self.bhwnd, self.hwnd):
             put(hwnd, self.lv, self.rect)
-        if kind == "size" and not self.redraw:
-            self.redraw = self.root.after(40, self.redraw_now)
+        if side and not self.redraw:  # 옮기기는 그림이 그대로라 다시 안 그린다
+            self.redraw = self.root.after_idle(self.redraw_now)
 
     def redraw_now(self):
         self.redraw = None
         self.draw()
 
     def on_release(self, e):
-        if self.drag and list(self.rect) != self.cfg["rect"]:
-            self.cfg["rect"] = list(self.rect)
-            jsave("config.json", self.cfg)
-            self.draw()
         self.drag = None
 
     def open_popup(self, day, x, y):
@@ -877,10 +942,15 @@ class DeskCal:
 
     def on_menu(self, e):
         m = tk.Menu(self.root, tearoff=0)
-        m.add_command(label="노션 새로고침", command=self.sync)
-        m.add_command(label="설정…", command=self.open_settings)
-        m.add_separator()
-        m.add_command(label="달력 끝내기", command=self.stop)
+        if self.edit:
+            m.add_command(label="위치·크기 저장", command=lambda: self.end_edit(True))
+            m.add_command(label="취소 (원래대로)", command=lambda: self.end_edit(False))
+        else:
+            m.add_command(label="노션 새로고침", command=self.sync)
+            m.add_command(label="위치·크기 바꾸기", command=self.start_edit)
+            m.add_command(label="설정…", command=self.open_settings)
+            m.add_separator()
+            m.add_command(label="달력 끝내기", command=self.stop)
         self.keep_order()
         m.tk_popup(e.x_root, e.y_root)
         if not self.quit and self.root.winfo_exists():
@@ -1346,6 +1416,8 @@ class Settings:
         bar = tk.Frame(t, bg=POP_BG)
         bar.grid(row=10, column=0, columnspan=5, sticky="e", pady=(10, 0))
         tk.Label(bar, text=f"v{VERSION}", fg="#78909c", bg=POP_BG, font=(FONT, 8)).pack(side="left", padx=8)
+        tk.Button(bar, text="위치·크기 바꾸기", command=lambda: (t.destroy(), app.start_edit()), font=(FONT, 9),
+                  relief="flat", bg="#455a64", fg="#ffffff").pack(side="left", padx=4)
         tk.Button(bar, text="DesktopCal 글꼴로 되돌리기", command=self.reset, font=(FONT, 9), relief="flat",
                   bg="#455a64", fg="#ffffff").pack(side="left", padx=4)
         tk.Button(bar, text="닫기", command=t.destroy, font=(FONT, 9), relief="flat", bg="#455a64",
