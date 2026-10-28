@@ -49,7 +49,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import colorchooser, ttk
 
-VERSION = "1.0.5"  # exe 배포판 — 올리고 desk_cal_release.py를 돌리면 설치된 exe들이 받아 간다
+VERSION = "1.0.6"  # exe 배포판 — 올리고 desk_cal_release.py를 돌리면 설치된 exe들이 받아 간다
 REPO = "abcaba123/nabu-desk-cal"
 FROZEN = getattr(sys, "frozen", False)
 INSTALL = Path(os.environ["LOCALAPPDATA"]) / "nabu-desk-cal" / "desk_cal.exe"
@@ -817,7 +817,8 @@ class DeskCal:
         mx, my, bw = w // 2, h // 2, min(230, w // 2 - 24)
         cv.create_rectangle(mx - bw, my - 78, mx + bw, my + 62, fill=POP_BG, outline=EDIT_COLOR)
         cv.create_text(mx, my - 52, text=f"{w} × {h}", fill="#ffffff", font=(FONT, 16, "bold"))
-        cv.create_text(mx, my - 22, text="안쪽을 끌면 위치 · 테두리·모서리를 끌면 크기", fill="#b0bec5", font=(FONT, 10))
+        cv.create_text(mx, my - 22, text=self.edit.get("err") or "안쪽을 끌면 위치 · 테두리·모서리를 끌면 크기",
+                       fill="#ff8a80" if self.edit.get("err") else "#b0bec5", font=(FONT, 10))
         for dx, label, color, fn in ((-60, "저장", "#2e7d32", lambda: self.end_edit(True)),
                                      (60, "취소", "#455a64", lambda: self.end_edit(False))):
             box = (mx + dx - 50, my + 6, mx + dx + 50, my + 44)
@@ -860,9 +861,16 @@ class DeskCal:
     def end_edit(self, save):
         if not self.edit:
             return
-        if save:
-            self.cfg["rect"] = list(self.rect)
-            jsave("config.json", self.cfg)
+        if save:  # 파일에 써진 뒤에만 cfg를 바꾼다 — 실패한 채 취소하면 다음 설정 저장 때 취소한 자리가 들어갔다(Codex desk-cal-edit 2)
+            cfg = {**self.cfg, "rect": list(self.rect)}
+            try:
+                jsave("config.json", cfg)
+            except OSError as e:
+                log(f"위치·크기 저장 실패: {e}")
+                self.edit["err"] = "저장 못 함 — 다시 [저장]하거나 [취소]"
+                self.draw()
+                return
+            self.cfg.update(cfg)
         else:
             self.rect = self.edit["orig"]
             for hwnd in (self.bhwnd, self.hwnd):
@@ -1470,13 +1478,17 @@ class Settings:
             r = [int(v) for v in self.entries["rect"].get().split(",")]
         except ValueError:
             r = []
-        if len(r) != 4 or r[2] < 400 or r[3] < 300:
-            self.note.config(text="위치는 X,Y,너비,높이 숫자 4개(너비 400·높이 300 이상)", fg="#ff8a80")
+        if len(r) != 4 or r[2] < MIN_W or r[3] < MIN_H:
+            self.note.config(text=f"위치는 X,Y,너비,높이 숫자 4개(너비 {MIN_W}·높이 {MIN_H} 이상)", fg="#ff8a80")
             return
-        self.app.cfg["rect"] = r
-        jsave("config.json", self.app.cfg)
+        # 숫자로 옮겨도 위치·크기 바꾸기 판으로 보여 주고 [저장]해야 남는다(Codex desk-cal-edit 2·4 — 저장·취소를 건너뛰던 것)
         self.top.destroy()
-        self.app.stop(restart=True)
+        app = self.app
+        app.start_edit()
+        app.rect = tuple(r)
+        for hwnd in (app.bhwnd, app.hwnd):
+            put(hwnd, app.lv, app.rect)
+        app.draw()
 
     def reset(self):
         got = {**DEFAULT_FONTS, **import_fonts()}
