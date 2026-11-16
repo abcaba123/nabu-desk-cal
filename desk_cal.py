@@ -49,7 +49,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import colorchooser, ttk
 
-VERSION = "1.0.6"  # exe 배포판 — 올리고 desk_cal_release.py를 돌리면 설치된 exe들이 받아 간다
+VERSION = "1.0.7"  # exe 배포판 — 올리고 desk_cal_release.py를 돌리면 설치된 exe들이 받아 간다
 REPO = "abcaba123/nabu-desk-cal"
 FROZEN = getattr(sys, "frozen", False)
 INSTALL = Path(os.environ["LOCALAPPDATA"]) / "nabu-desk-cal" / "desk_cal.exe"
@@ -85,6 +85,7 @@ FONT = "맑은 고딕"
 DOW = "일월화수목금토"
 # 달력 글꼴 [글꼴, 크기pt, 굵게, 색] — 첫 실행 때 DesktopCal 설정에서 가져와 config.json "fonts"에 둔다(⚙ 설정에서 바꿈)
 DEFAULT_FONTS = {"date": [FONT, 10, True, "#ffffff"], "memo": [FONT, 10, False, "#ffffff"], "today": TODAY}
+OUTLINE = [0, "#000000"]  # ⚙ 글자 테두리 [굵기 px, 색] — 0 = 없음
 # 날짜 옆 작은 글씨(DesktopCal 24절기·기념일 표시 옮김, 10-27) — 공휴일은 holidays.json
 TERM_COLOR = "#9ccc65"
 TERMS = ["소한", "대한", "입춘", "우수", "경칩", "춘분", "청명", "곡우", "입하", "소만", "망종", "하지",
@@ -109,6 +110,8 @@ u.SetParent.argtypes = [W.HWND, W.HWND]
 u.GetParent.restype = W.HWND
 u.GetParent.argtypes = [W.HWND]
 u.IsWindow.argtypes = [W.HWND]
+u.GetWindow.restype = W.HWND
+u.GetWindow.argtypes = [W.HWND, W.UINT]
 u.GetWindowLongPtrW.restype = ctypes.c_ssize_t
 u.GetWindowLongPtrW.argtypes = [W.HWND, ctypes.c_int]
 u.SetWindowLongPtrW.restype = ctypes.c_ssize_t
@@ -173,6 +176,14 @@ def cref(hexc):
 def ink(c, key):
     """고른 색이 마침 그 창에서 뚫리는 색이면 한 단계 비켜 그린다 — 저장 색은 그대로(Codex desk-cal-layers 2)"""
     return f"#{int(key[1:], 16) ^ 1:06x}" if c and c.lower() == key else c
+
+
+def seen_color(c, pct):
+    """칸 색에 바탕화면 단색이 pct% 비쳐 보이는 색 — 색칠한 칸을 앞 창에 깔 때 겉모습을 뒤 창 반투명과 맞춘다"""
+    ref = u.GetSysColor(1)  # COLOR_DESKTOP
+    under = (ref & 255, ref >> 8 & 255, ref >> 16 & 255)
+    rgb = [int(c[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(round(a * (100 - pct) / 100 + b * pct / 100) for a, b in zip(rgb, under))
 
 
 def colorref(h):
@@ -246,6 +257,10 @@ def fetch_rows():
 
 def set_shoot(page_id, iso):
     notion("PATCH", f"pages/{page_id}", {"properties": {"촬영일": {"date": {"start": iso} if iso else None}}})
+
+
+def set_title(page_id, title):
+    notion("PATCH", f"pages/{page_id}", {"properties": {"제목": {"title": [{"text": {"content": title}}]}}})
 
 
 def stage_of(status):
@@ -518,7 +533,8 @@ class DeskCal:
         cache = jload("notion_cache.json", {})
         self.rows, self.synced, self.err = cache.get("rows", []), cache.get("at"), None
         self.q, self.popup, self.quit, self.syncing = queue.Queue(), None, False, False
-        self.local = {}  # 행 id → (촬영일, 저장 끝난 시각) — 저장 전에 출발한 읽기가 늦게 와도 덮지 않게
+        self.local = {}  # (행 id, "shoot"|"title") → (값, 저장 끝난 시각) — 저장 전에 출발한 읽기가 늦게 와도 덮지 않게
+        self.renaming = {}  # 행 id → 노션에 보내는 중인 제목(같은 제목을 두 번 안 보냄)
         self.want_attach = attach_desktop
         self.saving, self.rows_started = False, 0.0
         self.today_seen = dt.date.today()
@@ -563,6 +579,7 @@ class DeskCal:
         self.root.after(200, self.pump)
         self.root.after(SYNC_MS, self.tick)
         self.root.after(5000, self.watch)
+        self.root.after(1000, self.guard)
         if FROZEN:
             self.root.after(30_000, self.check_update)
 
@@ -622,6 +639,21 @@ class DeskCal:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def rename(self, row, title):
+        """「이 날 촬영」 제목을 고치면 노션 행 제목도(11-16 사용자 「캘린더에서 글자 수정하면 노션에서도」)"""
+        if self.renaming.get(row["id"]) == title:
+            return
+        self.renaming[row["id"]] = title
+
+        def work():
+            try:
+                set_title(row["id"], title)
+                self.q.put(("renamed", row["id"], title, time.monotonic()))
+            except Exception as e:
+                self.q.put(("rename_err", row["id"], f"노션에 제목 못 씀: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def pump(self):
         try:
             while True:
@@ -634,8 +666,9 @@ class DeskCal:
                     self.rows_started = started
                     self.local = {k: v for k, v in self.local.items() if v[1] > started}
                     for r in rows:
-                        if r["id"] in self.local:
-                            r["shoot"] = self.local[r["id"]][0]
+                        for key in ("shoot", "title"):
+                            if (r["id"], key) in self.local:
+                                r[key] = self.local[(r["id"], key)][0]
                     same = rows == self.rows and self.err is None
                     self.err = None
                     self.rows, self.synced = rows, dt.datetime.now().isoformat(timespec="minutes")
@@ -645,13 +678,26 @@ class DeskCal:
                         continue
                 elif msg[0] == "assigned":
                     self.saving = False
-                    self.local[msg[1]] = (msg[2], msg[3])
+                    self.local[(msg[1], "shoot")] = (msg[2], msg[3])
                     for r in self.rows:
                         if r["id"] == msg[1]:
                             r["shoot"] = msg[2]
                     jsave("notion_cache.json", {"at": self.synced, "rows": self.rows})
                     if msg[2] and self.popup:  # 골랐으면 창 닫기, 뺐으면 창 그대로
                         self.popup.close()
+                elif msg[0] == "renamed":
+                    self.renaming.pop(msg[1], None)
+                    self.local[(msg[1], "title")] = (msg[2], msg[3])
+                    for r in self.rows:
+                        if r["id"] == msg[1]:
+                            r["title"] = msg[2]
+                    jsave("notion_cache.json", {"at": self.synced, "rows": self.rows})
+                elif msg[0] == "rename_err":  # 고친 글은 칸에 남는다 — Enter로 다시
+                    self.renaming.pop(msg[1], None)
+                    log(msg[2])
+                    if self.popup:
+                        self.popup.set_status(msg[2], "#ff8a80")
+                    continue
                 elif msg[0] == "assign_err":  # 읽기 상태(syncing·err)는 건드리지 않는다
                     self.saving = False
                     log(msg[1])
@@ -777,14 +823,19 @@ class DeskCal:
             bg = (GAME_BG.get(mine[0]["game"], GAME_BG["마크"]) if mine else cell.get("bg")
                   or (WEEKEND if day.weekday() >= 5 else CELL))
             bc.create_rectangle(x, y, x + cw, y + ch, fill=ink(bg, BKEY), width=0)
+            if bg.lower() != CELL:  # 글씨 가장자리가 KEY 회색과 섞여 어두운 테두리가 되므로 색칠한 칸은 앞 창에도 깐다
+                cv.create_rectangle(x, y, x + cw, y + ch, width=0,
+                                    fill=ink(seen_color(bg, int(self.cfg.get("cell_trans", CELL_TRANS))), KEY))
             if day == today:
                 cv.create_rectangle(x, y, x + cw, y + ch, width=2, outline=ink(fonts["today"], KEY))
             num = cv.create_text(x + 4, y + 3, text=str(day.day), fill=dcol, anchor="nw", font=dfont)
             ty = cv.bbox(num)[3] + 2
             lx = cv.bbox(num)[2] + 8
+            self.outline(num)
             for text, color in self.day_labels(day):
                 lab = cv.create_text(lx, y + 4, text=text, fill=color, anchor="nw", font=(FONT, 9))
                 lx = cv.bbox(lab)[2] + 6
+                self.outline(lab)
             lines = [("▶ " + bmp(r["title"]), pfont) for r in mine]
             lines += [(bmp(t), mfont) for t in cell.get("text", "").split("\n") if t.strip()]
             for text, font in lines:
@@ -792,10 +843,24 @@ class DeskCal:
                 y2 = cv.bbox(t)[3]
                 if y2 > y + ch - 2:
                     cv.delete(t)
-                    cv.create_text(x + cw - 4, y + ch - 2, text="…", fill=mcol, anchor="se", font=pfont)
+                    self.outline(cv.create_text(x + cw - 4, y + ch - 2, text="…", fill=mcol, anchor="se", font=pfont))
                     break
+                self.outline(t)
                 ty = y2 + 1
             self.cellmap.append((x, y, x + cw, y + ch, day))
+
+    def outline(self, item):
+        """⚙ 글자 테두리: 같은 글자를 테두리 색으로 둘레에 찍어 글자 밑에 깐다(Tk 글자엔 테두리 옵션이 없다)"""
+        size, color = self.cfg.get("outline") or OUTLINE
+        if not size:
+            return
+        cv = self.cv
+        x, y = cv.coords(item)
+        opts = {k: cv.itemcget(item, k) for k in ("text", "anchor", "font", "width")}
+        for dx in range(-size, size + 1):
+            for dy in range(-size, size + 1):
+                if (dx or dy) and dx * dx + dy * dy <= size * size + 1:
+                    cv.tag_lower(cv.create_text(x + dx, y + dy, fill=ink(color, KEY), **opts), item)
 
     def draw_edit(self, w, h):
         """위치·크기 바꾸기 화면 — 칸 대신 가벼운 판(테두리·칸 선·손잡이·저장/취소)만 그려 끌 때마다 다시 그려도 안 끊긴다.
@@ -883,6 +948,20 @@ class DeskCal:
     def keep_order(self):
         """뒤 창을 앞 창 바로 밑으로 — 일반 창으로 떠 있을 때 뒤 창이 눌려 활성화되면 글씨가 가려진다(Codex desk-cal-layers 1)"""
         u.SetWindowPos(self.bhwnd, self.hwnd, 0, 0, 0, 0, 0x0013)  # NOSIZE|NOMOVE|NOACTIVATE
+
+    def guard(self):
+        """뒤 창이 앞 창 위로 올라가면 글씨가 전부 가려진다(10-29 부팅 뒤 실측). 켜질 때·후보/월/설정 창 열고 닫기·
+        클릭 활성화 메시지로는 재현 안 돼 뒤집는 쪽을 아직 모른다 → 1초마다 확인해 되돌리고 그때 상황을 남긴다"""
+        self.root.after(1000, self.guard)
+        h = self.hwnd
+        while h:
+            h = u.GetWindow(h, 3)  # GW_HWNDPREV — 앞 창보다 위에 있는 형제
+            if h == self.bhwnd:
+                self.keep_order()
+                fg = ctypes.create_unicode_buffer(64)
+                u.GetClassNameW(u.GetForegroundWindow(), fg, 64)
+                log(f"뒤 창이 앞 창 위에 있었음 — 되돌림 (맨 앞 창 {fg.value}, 후보 창 {'열림' if self.popup else '닫힘'})")
+                return
 
     def day_at(self, x, y):
         for x1, y1, x2, y2, day in self.cellmap:
@@ -1063,6 +1142,7 @@ class Popup:
         self.status.pack(fill="x", padx=10, pady=(4, 0))
         self.assigned = tk.Frame(t, bg=POP_BG)
         self.assigned.pack(fill="x")
+        self.titles, self.entries = {}, {}  # 행 id → (제목 칸 글, 노션에서 받은 제목) / 행 id → 제목 칸
         self.game = "마크" if day.weekday() == 5 else "전체"  # 10-26 사용자 '토=마크' — 기본값일 뿐, 버튼으로 바꾼다
         self.filters = tk.Frame(t, bg=POP_BG)
         self.filters.pack(fill="x")
@@ -1132,18 +1212,38 @@ class Popup:
         if not self.top.winfo_exists():
             return
         self.set_status(*self.app.status_text())
+        try:  # 고치는 중인 제목 칸 — 다시 그린 뒤에도 커서를 그 자리에
+            foc = self.top.focus_get()
+        except (KeyError, tk.TclError):
+            foc = None
+        keep = next(((rid, e.index("insert")) for rid, e in self.entries.items() if e is foc), None)
         for f in (self.assigned, self.filters, self.inner):
             for w in f.winfo_children():
                 w.destroy()
+        self.entries = {}
         mine = [r for r in self.app.rows if r["shoot"] == self.iso]
         self.assigned.configure(height=1)  # 자식을 다 지워도 Tk 프레임은 옛 높이를 유지한다 — [빼기] 뒤 빈칸
         if mine:
-            tk.Label(self.assigned, text="이 날 촬영", fg="#b0bec5", bg=POP_BG, font=(FONT, 9)).pack(anchor="w", padx=10, pady=(6, 0))
+            tk.Label(self.assigned, text="이 날 촬영 — 제목을 고치고 Enter면 노션 제목도 바뀜", fg="#b0bec5", bg=POP_BG,
+                     font=(FONT, 9)).pack(anchor="w", padx=10, pady=(6, 0))
         for r in mine:
             f = tk.Frame(self.assigned, bg=GAME_BG.get(r["game"], GAME_BG["마크"]))
             f.pack(fill="x", padx=10, pady=2)
-            tk.Label(f, text=bmp(r["title"]), fg="#ffffff", bg=f["bg"], font=(FONT, 10, "bold"), anchor="w",
-                     justify="left", wraplength=380).pack(side="left", padx=8, pady=5, fill="x", expand=True)
+            shown = bmp(r["title"])
+            var, base = self.titles.get(r["id"], (None, None))
+            if var is None or var.get() in (base, shown):  # 안 고친 칸은 노션 제목을 따라가고, 고치던 글은 남긴다
+                var = var or tk.StringVar(self.top)
+                var.set(shown)
+                self.titles[r["id"]] = (var, shown)
+            e = self.entries[r["id"]] = tk.Entry(
+                f, textvariable=var, fg="#ffffff", bg=f["bg"], insertbackground="#ffffff", relief="flat",
+                font=(FONT, 10, "bold"), highlightthickness=1, highlightbackground=f["bg"], highlightcolor="#ffffff")
+            e.pack(side="left", padx=8, pady=5, fill="x", expand=True)
+            e.bind("<Return>", lambda ev, r=r: self.commit(r))
+            e.bind("<FocusOut>", lambda ev, r=r: ev.widget.winfo_exists() and self.commit(r))  # 다시 그리느라 지운 칸은 빼고
+            if keep and keep[0] == r["id"]:
+                e.focus_set()
+                e.icursor(keep[1])
             tk.Button(f, text="빼기", command=lambda r=r: self.app.assign(r, None), font=(FONT, 9), relief="flat",
                       bg="#263238", fg="#ffffff", activebackground="#37474f").pack(side="right", padx=6)
         shown, hidden = self.render_filters()
@@ -1291,13 +1391,26 @@ class Popup:
         self.orig = (text, self.bg)
         return True
 
+    def commit(self, r):
+        """제목 칸 → 노션 행 제목(Enter·다른 곳 누름·창 닫을 때). 비우면 원래 제목으로.
+        Tk가 못 그리는 이모지는 칸에 없어서, 고치면 노션 제목에서도 빠진다"""
+        var, _ = self.titles[r["id"]]
+        new = var.get().strip()
+        if not new:
+            var.set(bmp(r["title"]))
+        elif new != bmp(r["title"]):
+            self.app.rename(r, new)
+
     def save(self):
         self.close()
 
     def close(self):
-        """Esc·닫기·창 닫기·후보를 골라 닫힐 때·달력을 끝낼 때 모두 바뀐 메모·색을 저장한다.
-        저장이 실패하면 창을 닫지 않는다(Codex desk-cal-gap 6)"""
+        """Esc·닫기·창 닫기·후보를 골라 닫힐 때·달력을 끝낼 때 모두 바뀐 메모·색·제목을 저장한다.
+        메모 저장이 실패하면 창을 닫지 않는다(Codex desk-cal-gap 6)"""
         if self.top.winfo_exists():
+            for r in self.app.rows:
+                if r["id"] in self.titles:
+                    self.commit(r)
             if self._pending:
                 self.top.after_cancel(self._pending)
             if not self.flush():
@@ -1398,6 +1511,15 @@ class Settings:
             row=3, column=1, sticky="w", padx=6)
         tk.Label(t, text="칸 바탕만 비침(글씨는 그대로) · 칸 사이·바깥은 바탕화면 · DesktopCal 기본 10", fg="#b0bec5", bg=POP_BG,
                  font=(FONT, 8)).grid(row=4, column=1, columnspan=4, sticky="w", padx=6)
+        tk.Label(t, text="글자 테두리", fg="#ffffff", bg=POP_BG, font=(FONT, 10)).grid(row=6, column=0, sticky="w", pady=(6, 0))
+        size, self.outline = app.cfg.get("outline") or OUTLINE
+        self.outline_size = tk.IntVar(value=size)
+        box = tk.Frame(t, bg=POP_BG)
+        box.grid(row=6, column=1, sticky="w", padx=6, pady=(6, 0))
+        tk.Spinbox(box, from_=0, to=3, textvariable=self.outline_size, width=4, command=self.apply, state="readonly").pack(side="left")
+        tk.Label(box, text="px (0 = 없음)", fg="#b0bec5", bg=POP_BG, font=(FONT, 8)).pack(side="left", padx=6)
+        self.outline_btn = tk.Button(t, text="  색  ", bg=self.outline, relief="flat", command=lambda: self.pick("outline"))
+        self.outline_btn.grid(row=6, column=4, pady=(6, 0))
         self.terms, self.days = (tk.BooleanVar(value=app.cfg.get(k, True)) for k in ("show_terms", "show_days"))
         opts = tk.Frame(t, bg=POP_BG)
         opts.grid(row=5, column=1, columnspan=4, sticky="w", padx=2, pady=(6, 0))
@@ -1409,20 +1531,20 @@ class Settings:
         self.entries = {}
         for r, (key, label, val) in enumerate((("token", "노션 토큰", n.get("token", "")),
                                                ("db", "후보 표 링크", n.get("db", "")),
-                                               ("rect", "위치 X,Y,W,H", ",".join(map(str, app.rect)))), start=6):
+                                               ("rect", "위치 X,Y,W,H", ",".join(map(str, app.rect)))), start=7):
             tk.Label(t, text=label, fg="#ffffff", bg=POP_BG, font=(FONT, 10)).grid(
-                row=r, column=0, sticky="w", pady=(10 if r == 6 else 4, 0))
+                row=r, column=0, sticky="w", pady=(10 if r == 7 else 4, 0))
             e = self.entries[key] = tk.Entry(t, width=46, show="•" if key == "token" else "")
             e.insert(0, val)
-            e.grid(row=r, column=1, columnspan=3, sticky="w", padx=6, pady=(10 if r == 6 else 4, 0))
+            e.grid(row=r, column=1, columnspan=3, sticky="w", padx=6, pady=(10 if r == 7 else 4, 0))
         tk.Button(t, text="연결", command=self.connect, font=(FONT, 9), relief="flat", bg="#455a64", fg="#ffffff",
-                  padx=10).grid(row=7, column=4, pady=(4, 0))
+                  padx=10).grid(row=8, column=4, pady=(4, 0))
         tk.Button(t, text="옮기기", command=self.move, font=(FONT, 9), relief="flat", bg="#455a64", fg="#ffffff",
-                  padx=4).grid(row=8, column=4, pady=(4, 0))
+                  padx=4).grid(row=9, column=4, pady=(4, 0))
         self.note = tk.Label(t, text="", fg="#b0bec5", bg=POP_BG, font=(FONT, 8))
-        self.note.grid(row=9, column=1, columnspan=4, sticky="w", padx=6)
+        self.note.grid(row=10, column=1, columnspan=4, sticky="w", padx=6)
         bar = tk.Frame(t, bg=POP_BG)
-        bar.grid(row=10, column=0, columnspan=5, sticky="e", pady=(10, 0))
+        bar.grid(row=11, column=0, columnspan=5, sticky="e", pady=(10, 0))
         tk.Label(bar, text=f"v{VERSION}", fg="#78909c", bg=POP_BG, font=(FONT, 8)).pack(side="left", padx=8)
         tk.Button(bar, text="위치·크기 바꾸기", command=lambda: (t.destroy(), app.start_edit()), font=(FONT, 9),
                   relief="flat", bg="#455a64", fg="#ffffff").pack(side="left", padx=4)
@@ -1432,13 +1554,16 @@ class Settings:
                   fg="#ffffff", padx=12).pack(side="left")
 
     def pick(self, key):
-        cur = self.today if key == "today" else self.rows[key][3]
+        cur = {"today": self.today, "outline": self.outline}.get(key) or self.rows[key][3]
         rgb, hexc = colorchooser.askcolor(color=cur, parent=self.top, title="색 고르기")
         if not hexc:
             return
         if key == "today":
             self.today = hexc
             self.today_btn.config(bg=hexc)
+        elif key == "outline":
+            self.outline = hexc
+            self.outline_btn.config(bg=hexc)
         else:
             self.rows[key][3] = hexc
             self.rows[key][4].config(bg=hexc)
@@ -1455,7 +1580,7 @@ class Settings:
         self.app.cfg["fonts"] = fonts
         if hasattr(self, "days"):  # 창을 다 그리기 전(색 고르기 등)엔 글꼴만
             self.app.cfg.update(cell_trans=int(self.alpha.get()), show_terms=bool(self.terms.get()),
-                                show_days=bool(self.days.get()))
+                                show_days=bool(self.days.get()), outline=[int(self.outline_size.get()), self.outline])
             self.app.apply_alpha()
         jsave("config.json", self.app.cfg)
         self.app.draw()
