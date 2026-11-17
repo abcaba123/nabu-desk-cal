@@ -49,7 +49,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import colorchooser, ttk
 
-VERSION = "1.0.7"  # exe 배포판 — 올리고 desk_cal_release.py를 돌리면 설치된 exe들이 받아 간다
+VERSION = "1.0.8"  # exe 배포판 — 올리고 desk_cal_release.py를 돌리면 설치된 exe들이 받아 간다
 REPO = "abcaba123/nabu-desk-cal"
 FROZEN = getattr(sys, "frozen", False)
 INSTALL = Path(os.environ["LOCALAPPDATA"]) / "nabu-desk-cal" / "desk_cal.exe"
@@ -62,14 +62,16 @@ SYNC_MS = 5 * 60 * 1000
 UPDATE_MS = 24 * 3600 * 1000  # DesktopCal 업데이터와 같은 하루 주기(10-27 사용자)
 MUTEX = None
 
-STATUS_ORDER = ["촬영 확정", "예정", "다음 순위", "후보", "조사 대기", "대기", "보류"]
+# 「🎮 요즘 뜨는 게임」 표(game_watch)의 게임 = 종합게임 후보 상태 이름(11-17 사용자 「종합게임 하고 싶은것도 캘린더에」)
+HOT = "요즘 뜨는 게임"
+STATUS_ORDER = ["촬영 확정", "예정", "다음 순위", "후보", HOT, "조사 대기", "대기", "보류"]
 HIDE_STATUS = {"업로드됨", "제외"}
 # 후보 창 단계 버튼(10-27 사용자 「단계 3개로 묶기」) — 자동 수집 '대기' 행이 매일 늘어 기본은 확정+후보만
-STAGES = [("확정", {"촬영 확정", "예정"}), ("후보", {"다음 순위", "후보"}), ("검토", None)]  # None = 나머지 전부(새 상태 포함)
-GAME_ORDER = ["마크", "GTA", "공통"]
-STATUS_BG = {"촬영 확정": "#2e7d32", "예정": "#00838f", "다음 순위": "#1565c0", "후보": "#546e7a",
+STAGES = [("확정", {"촬영 확정", "예정"}), ("후보", {"다음 순위", "후보", HOT}), ("검토", None)]  # None = 나머지 전부(새 상태 포함)
+GAME_ORDER = ["마크", "GTA", "종합게임", "공통"]
+STATUS_BG = {"촬영 확정": "#2e7d32", "예정": "#00838f", "다음 순위": "#1565c0", "후보": "#546e7a", HOT: "#6a1b9a",
              "조사 대기": "#6d4c41", "대기": "#616161", "보류": "#424242"}
-GAME_BG = {"마크": "#3737f4", "GTA": "#c2185b", "공통": "#00897b"}  # 마크 = 사용자가 DesktopCal '마크 컨텐츠'에 쓴 파랑
+GAME_BG = {"마크": "#3737f4", "GTA": "#c2185b", "종합게임": "#7b1fa2", "공통": "#00897b"}  # 마크 = 사용자가 DesktopCal '마크 컨텐츠'에 쓴 파랑
 # DesktopCal 테마에서 뽑은 색 (10-26 화면 캡처). HEAD는 후보·달 고르기 창 바탕
 HEAD, TODAY, HOLI = "#3a3b3c", "#ffd54f", "#ffd54f"
 # 달력 칸 = DesktopCal처럼 칸 사이·바깥은 뚫고 칸 바탕만 반투명(10-28 사용자 「회색 그걸로 바탕이 투명해야지」).
@@ -140,6 +142,13 @@ def jload(name, default):
         return json.loads((DATA / name).read_text(encoding="utf-8"))
     except FileNotFoundError:
         return default
+
+
+def cells_mtime():
+    try:
+        return (DATA / "cells.json").stat().st_mtime_ns
+    except FileNotFoundError:
+        return 0
 
 
 def jsave(name, obj):
@@ -251,8 +260,48 @@ def fetch_rows():
         res = notion("POST", f"databases/{db}/query", {"page_size": 100, **({"start_cursor": cur} if cur else {})})
         rows += [parse_row(p) for p in res["results"]]
         if not res.get("has_more"):
-            return rows
+            break
         cur = res["next_cursor"]
+    try:
+        rows += fetch_hot(rows)
+    except Exception as e:  # 뜨는 게임 표를 못 읽어도 긴영상 후보는 그대로 띄운다
+        log(f"요즘 뜨는 게임 못 읽음: {e}")
+    return rows
+
+
+def fetch_hot(rows):
+    """「🎮 요즘 뜨는 게임」 표(game_watch, 7일 뒤 지움) → 종합게임 후보(id 'hot:…'). 표 id가 없으면(조나스 exe) 없음.
+    긴영상 후보에 같은 이름의 종합게임 행이 이미 있으면 뺀다 — 날짜에 넣으면 그 행으로 복사되기 때문"""
+    db = env().get("NOTION_DB_GAMES")
+    if not db:
+        return []
+    have = {r["title"].strip().casefold() for r in rows if r["game"] == "종합게임"}
+    out, cur = [], None
+    while True:
+        res = notion("POST", f"databases/{db}/query", {"page_size": 100, **({"start_cursor": cur} if cur else {})})
+        for p in res["results"]:
+            pr = p["properties"]
+            name = "".join(t["plain_text"] for t in (pr.get("게임") or {}).get("title") or []).strip()
+            if not name or name.casefold() in have:
+                continue
+            groups = "·".join(o["name"] for o in (pr.get("묶음") or {}).get("multi_select") or [])
+            link = (pr.get("스팀") or {}).get("url") or (pr.get("치지직") or {}).get("url")
+            out.append({"id": "hot:" + p["id"], "title": name, "game": "종합게임", "status": HOT, "ratio": None,
+                        "shoot": None, "skip": False, "uploaded": False,
+                        "memo": "🎮 요즘 뜨는 게임에서 옮김" + (f" (묶음: {groups})" if groups else "")
+                                + (f" · {link}" if link else "")})
+        if not res.get("has_more"):
+            return out
+        cur = res["next_cursor"]
+
+
+def create_from_hot(row, iso):
+    """뜨는 게임을 날짜에 넣으면 긴영상 후보에 종합게임 행으로 복사 — 그 표가 7일 뒤 지워도 일정은 남게.
+    스팀 주소는 메모에만 — `링크` 칸은 notion_scout가 유튜브 영상으로 읽는 칸이다"""
+    props = {"제목": {"title": [{"text": {"content": row["title"]}}]}, "게임": {"select": {"name": "종합게임"}},
+             "상태": {"select": {"name": "예정"}}, "촬영일": {"date": {"start": iso}},
+             "메모": {"rich_text": [{"text": {"content": row["memo"]}}]}}
+    return parse_row(notion("POST", "pages", {"parent": {"database_id": env()["NOTION_DB_LONG"]}, "properties": props}))
 
 
 def set_shoot(page_id, iso):
@@ -524,6 +573,7 @@ class DeskCal:
         rect = self.rect
         self.month = dt.date.today().replace(day=1)
         self.cells = jload("cells.json", {})
+        self.cells_mtime = cells_mtime()
         try:
             bundled = json.loads(HOLIDAYS.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -632,6 +682,9 @@ class DeskCal:
 
         def work():
             try:
+                if row["id"].startswith("hot:"):  # 뜨는 게임 → 긴영상 후보 새 행
+                    self.q.put(("created", row["id"], create_from_hot(row, iso), time.monotonic()))
+                    return
                 set_shoot(row["id"], iso)
                 self.q.put(("assigned", row["id"], iso, time.monotonic()))
             except Exception as e:
@@ -684,6 +737,13 @@ class DeskCal:
                             r["shoot"] = msg[2]
                     jsave("notion_cache.json", {"at": self.synced, "rows": self.rows})
                     if msg[2] and self.popup:  # 골랐으면 창 닫기, 뺐으면 창 그대로
+                        self.popup.close()
+                elif msg[0] == "created":
+                    self.saving = False
+                    self.rows_started = max(self.rows_started, msg[3])  # 만들기 전에 출발한 읽기엔 새 행이 없다 — 버린다
+                    self.rows = [r for r in self.rows if r["id"] != msg[1]] + [msg[2]]
+                    jsave("notion_cache.json", {"at": self.synced, "rows": self.rows})
+                    if self.popup:
                         self.popup.close()
                 elif msg[0] == "renamed":
                     self.renaming.pop(msg[1], None)
@@ -748,6 +808,8 @@ class DeskCal:
                 self.today_seen = today
                 self.draw()
                 backup_cells()
+            if self.reload_cells():
+                self.draw()
         except Exception:
             log("watch 오류\n" + traceback.format_exc())
 
@@ -1092,12 +1154,25 @@ class DeskCal:
         self.quit = not restart
         self.root.destroy()
 
+    def reload_cells(self):
+        """밖에서 cells.json 을 고친 경우(예비군 봇이 신청 날짜를 적음, 11-16) — 다시 읽어 메모리 사본이 덮어쓰지 않게"""
+        if cells_mtime() == self.cells_mtime:
+            return False
+        try:
+            self.cells = jload("cells.json", self.cells)
+        except ValueError:
+            return False
+        self.cells_mtime = cells_mtime()
+        return True
+
     def save_cell(self, iso, text, bg):
+        self.reload_cells()
         if text.strip() or bg:
             self.cells[iso] = {"text": text.strip(), "bg": bg}
         else:
             self.cells.pop(iso, None)
         jsave("cells.json", self.cells)
+        self.cells_mtime = cells_mtime()
         self.draw()
 
     # 색 고르기 첫 줄(10-27 사용자 「최근에 사용하거나 자주 사용하는 색이 저장되면 좋겠는데」)
